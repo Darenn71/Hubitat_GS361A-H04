@@ -1,0 +1,687 @@
+/**
+ *  Date: 2021-03-05
+ */
+
+import hubitat.helper.HexUtils
+
+metadata {
+	definition (name: "Zigbee - Siterwell GS361A-H04 TRV", namespace: "Mark-C-uk, Daren N", author: "MarkC, DarenN") {
+        capability "Configuration"
+        capability "TemperatureMeasurement"
+        capability "Thermostat"
+        capability "ThermostatHeatingSetpoint"
+        capability "ThermostatCoolingSetpoint"
+        capability "ThermostatSetpoint"
+        capability "Refresh"
+        capability "Battery"
+        
+        attribute "valve", "String"
+        attribute "WindowOpenDetection","String"
+        attribute "autolock","String"
+        attribute "childLock","String"
+        
+   
+    fingerprint endpointId: "01", profileId: "0104", inClusters: "0000,0004,0005,EF00", outClusters: "0019,000A", manufacturer: "_TZE200_zivfvd7h", model: "TS0601", deviceJoinName: "Zigbee - Siterwell GS361A-H04"
+}
+    
+    preferences {
+        //input("lock", "enum", title: "Do you want to lock your thermostat's physical keypad?", options: ["No", "Yes"], defaultValue: "No", required: false, displayDuringSetup: false)
+        input name: "infoLogging", type: "bool", title: "Enable info logging", defaultValue: true
+    
+    }
+}
+
+ArrayList<String> parse(String description) {
+    //log.debug "parse $description"
+    ArrayList<String> cmd = []
+    Map msgMap = null
+    
+//state.clear()
+    
+    if(description.indexOf('encoding: 42') >= 0) {
+        List values = description.split("value: ")[1].split("(?<=\\G..)")
+        String fullValue = values.join()
+        Integer zeroIndex = values.indexOf("01")
+            if(zeroIndex > -1) {
+                msgMap = zigbee.parseDescriptionAsMap(description.replace(fullValue, values.take(zeroIndex).join()))
+                values = values.drop(zeroIndex + 3)
+                msgMap["additionalAttrs"] = [
+                    ["encoding": "41",
+                    "value": parseXiaomiStruct(values.join(), isFCC0=false, hasLength=true)]
+                    ]
+                log.warn "encoding: 42 parse 37 IF true"
+            } 
+            else {
+                msgMap = zigbee.parseDescriptionAsMap(description) //modle name
+                log.warn "encoding: 42 parse 51 ELSE true"
+            }
+        } 
+        else {
+            msgMap = zigbee.parseDescriptionAsMap(description)
+        }
+    
+        if(msgMap.containsKey("encoding") && msgMap.containsKey("value") && msgMap["encoding"] != "41" && msgMap["encoding"] != "42") {
+            log.warn "parse line 59 used - ${description}"
+            msgMap["valueParsed"] = zigbee_generic_decodeZigbeeData(msgMap["value"], msgMap["encoding"])
+        }
+        
+        if(msgMap == [:] && description.indexOf("zone") == 0) {
+            msgMap["type"] = "zone"
+            java.util.regex.Matcher zoneMatcher = description =~ /.*zone.*status.*0x(?<status>([0-9a-fA-F][0-9a-fA-F])+).*extended.*status.*0x(?<statusExtended>([0-9a-fA-F][0-9a-fA-F])+).*/
+            if(zoneMatcher.matches()) {
+                  msgMap["parsed"] = true
+                  msgMap["status"] = zoneMatcher.group("status")
+                  msgMap["statusInt"] = Integer.parseInt(msgMap["status"], 16)
+                  msgMap["statusExtended"] = zoneMatcher.group("statusExtended")
+                  msgMap["statusExtendedInt"] = Integer.parseInt(msgMap["statusExtended"], 16)
+            } 
+            else {
+               msgMap["parsed"] = false
+            }
+            log.warn "line 64 section used"
+        }
+        commandtyp=msgMap["command"] // Get the command direction 01 is from TRV, 02 is from hub
+            //log.debug "  $msgMap "
+        //log.debug "Command decoded is $commandtyp"
+    
+    switch(msgMap["cluster"] + '_' + msgMap["attrId"]) {
+        case "0000_0001":
+            log.trace("Application ID Received")
+            if(msgMap['value']) {
+                updateDataValue("application", msgMap['value'])
+            }
+            break
+        case "0000_0004":
+        log.trace("Manufacturer Name Received ${msgMap['value']}")
+            if(msgMap['value']) {
+                updateDataValue("manufacturer", msgMap['value'])
+            }
+            break
+        case "0000_0005":
+            log.trace("Model Name Received")
+            if(msgMap['value']) {
+                updateDataValue('model', msgMap['value'])
+            }    
+            break
+        default:
+    //       log.debug " ${msgMap["attrId"]}"
+    //        log.debug " ${msgMap["cluster"]}  ${msgMap["attrId"]} $msgMap"
+            switch(msgMap["clusterId"]) {
+               
+                case "0013":
+                    logging("MULTISTATE CLUSTER EVENT")
+                    break
+                
+                case "8021":
+                    logging("BIND RESPONSE CLUSTER EVENT")
+                    break
+                
+                case "8001":
+                    logging("GENERAL CLUSTER EVENT")
+                    break
+                
+                case "8004":
+                    log.trace("Simple Descriptor Information Received - description:${description} | parseMap:${msgMap}")
+                    updateDataFromSimpleDescriptorData(msgMap["data"])
+                    break
+                
+                case "8031":
+                    logging("Link Quality Cluster Event - description:${description} | parseMap:${msgMap}")
+
+                    break
+                
+                case "8032":
+                    logging("Routing Table Cluster Event - description:${description} | parseMap:${msgMap}")
+                    break
+                
+                case "8021":
+                
+                case "8038":
+                    logging("GENERAL CATCHALL (0x${msgMap["clusterId"]}")
+                    break
+                
+///////////TUYA TRV messages////////////
+                
+                case "EF00":  
+                   // log.debug "clutsInt= ${msgMap[clusterInt]} ,att ID ${msgMap["attrId"]}, cluster ${msgMap["clusterId"]} -- ${msgMap}"
+                    List data = msgMap['data']
+                    if (data[2] && data[3]){
+                        String commandType = data[2] + data[3]
+                        //log.info "$commandType"
+                        switch(commandType){
+
+                            
+                            //set point temp
+                            case "0202": //set point temp
+				String SetPoint = HexUtils.hexStringToInt("${data[-2]}${data[-1]}") / 10
+                                logging("${device.displayName} Temp Set Point ${commandType}, ${SetPoint}")
+                                sendEvent(name: "heatingSetpoint", value: SetPoint.toFloat(), unit: "C")
+	                            sendEvent(name: "thermostatSetpoint", value: SetPoint.toFloat(), unit: "C")
+                                if (device.currentValue("thermostatMode") != "off" && SetPoint.toFloat() > device.currentValue("temperature").toFloat()) { 
+                                    sendEvent(name: "thermostatOperatingState", value: "heating")}
+                                else { sendEvent(name: "thermostatOperatingState", value: "idle")}
+                            endif
+                            break
+                            
+
+                            
+//0302 Temperature                            
+                            case '0302': //Temperature
+				String temperature = HexUtils.hexStringToInt("${data[-2]}${data[-1]}") / 10
+                                logging("${device.displayName} Temp ${temperature}, data ${msgMap["data"]}")
+                                sendEvent(name: "temperature", value: temperature, unit: "C" )
+                                if (device.currentValue("thermostatMode") != "off" && temperature.toFloat() < device.currentValue("thermostatSetpoint").toFloat()) {
+                                    sendEvent(name: "thermostatOperatingState", value: "heating")}
+                                else { sendEvent(name: "thermostatOperatingState", value: "idle")}
+                            endif
+                                break
+                            
+// OFF
+                            case '0101':
+                            sendEvent(name: "thermostatMode", value: "off" )
+                            state.ONOFF = "OFF"
+                            break
+                            
+// Mode                            
+                            case '0404':
+                            // Mode
+                            // break
+                            String mode = HexUtils.hexStringToInt(data[6])
+                           // if (setThermostatMode != "off" && state.ONOFF != "OFF"){
+                            //log.debug "$commandtyp"
+                            //if (commandtyp == "01") {
+                                switch (mode){
+                                    case '0':
+                                    log.debug "Got Eco from TRV, setting to heat as this mode is unsupported in Hubitat"
+                                    
+                                        sendEvent(name: "thermostatMode", value: "heat" )
+                                    state.ONOFF = "ON"
+                                    break
+                                    
+                                    case '1':
+                                    log.debug "Got mode Auto from TRV, setting to heat as this mode is unsupported in Hubitat"
+                                    
+                                        sendEvent(name: "thermostatMode", value: "heat" )
+                                    state.ONOFF = "ON"
+                                    
+                                    
+                                    break
+                                    case '2':
+                                    log.debug "Got mode manual from TRV, setting to heat - normal operation"
+                                    
+                                        sendEvent(name: "thermostatMode", value: "heat" )
+                                    state.ONOFF = "ON"
+                                    break
+                                    
+                                }
+                            //}
+                           // }
+                           
+
+                            break
+
+// battery --- DEV
+                            case '1502':
+                                //String values = data.collect{c -> HexUtils.hexStringToInt(c)}
+                                String batt = HexUtils.hexStringToInt(data[-1])
+                            state.batdev = batt //dv to see it it is ever peported
+                                logging("${device.displayName} battery ${batt}")
+                                sendEvent(name: "battery", value: batt, unit:"%", descriptionText: "reported from 1502")
+                            break
+
+                            
+                            case '0D05': // battery low warning
+                            String battminmax = HexUtils.hexStringToInt(data[-1])
+                            logging("${device.displayName} battery $data")
+                            if (battminmax == "0"){
+                                    if (device.currentValue("battery") == null || device.currentValue("battery") == 0 ) {
+                                        sendEvent(name: "battery", value: 100, unit:"%" )
+                                    }
+                            }
+                            else if (battminmax == "01" ||battminmax == "16"){//10 for low 
+                                sendEvent(name: "battery", value: 0, unit:"%", descriptionText: "battery value $battminmax" )
+                            }
+			                else if (battminmax == "02" ||battminmax == "16"){//10 for low 
+                                sendEvent(name: "battery", value: 999, unit:"%", descriptionText: "battery value $battminmax" )
+                            }
+                            break
+                            
+                         
+                            
+// Temperature correction reporting   
+                            case '2C02': //Temperature correction reporting
+                                String temperatureCorr = HexUtils.hexStringToInt(data[9])/ 10
+                                logging("${device.displayName} Temp correction reporting DEV STILL, ${temperatureCorr}, data ${msgMap["data"]}")
+                            break
+                            
+// Child lock                   
+                            case '0701': // Child lock
+                                String locked = HexUtils.hexStringToInt(data[6])
+                                logging("${device.displayName} child lock ${commandType}, ${locked} 1 - is locked 0 is unlocked")
+                                switch (locked){
+                                    case '0':
+                                        sendEvent(name: "childLock", value: "off" )
+                                    break
+                                    case '1':
+                                    sendEvent(name: "childLock", value: "on")
+                                    break
+                                }
+                            break
+                            
+                            
+                            case '1201': //window open detection
+                                                    
+                             String locked = HexUtils.hexStringToInt(data[6])
+                                logging("${device.displayName} child lock ${commandType}, ${locked} 1 - is locked 0 is unlocked")
+                                switch (locked){
+                                    case '0':
+                                        sendEvent(name: "childLock", value: "off" )
+                                    break
+                                    case '1':
+                                    sendEvent(name: "childLock", value: "on")
+                                    break
+                                }
+                            
+                            break
+                          
+                            
+                            case '0e04':
+                            break
+                            
+                            default:
+                                String values = data.collect{c -> HexUtils.hexStringToInt(c)}
+                                log.debug "${device.displayName} other EF00 cluster - ${commandType} - ${values} ${data}"
+                                break
+                        }
+                    }
+                    else { 
+                        // found data in map of, data:[02, 19]], data:[00, 00]]
+                        //logging("other cluster EF00 but map null- ${msgMap}", 100)
+                    }
+                    break
+                
+                /////////////////////////////////////////////////////////////////////////////////////////mc
+                default:
+                    log.debug "Unhandled Event IGNORE THIS - description:${description} | msgMap:${msgMap}"
+                    break
+            }
+            break
+    }
+    msgMap = null
+        return cmd
+}
+
+
+
+def logsOff(){
+    log.warn "debug logging disabled..."
+    device.updateSetting("logEnable",[value:"false",type:"bool"])
+}
+// from markus toolbox driver
+Map unpackStructInMap(Map msgMap, String originalEncoding="4C") {
+     
+    msgMap['encoding'] = originalEncoding
+    List<String> values = msgMap['value'].split("(?<=\\G..)")
+    logging("unpackStructInMap() values=$values", 1)
+    Integer numElements = Integer.parseInt(values.take(2).reverse().join(), 16)
+    values = values.drop(2)
+    List r = []
+    Integer cType = null
+    List ret = null
+    while(values != []) {
+        cType = Integer.parseInt(values.take(1)[0], 16)
+        values = values.drop(1)
+        ret = zigbee_generic_convertStructValueToList(values, cType)
+        r += ret[0]
+        values = ret[1]
+    }
+    if(r.size() != numElements) throw new Exception("The STRUCT specifies $numElements elements, found ${r.size()}!")
+     
+    msgMap['value'] = r
+    return msgMap
+}
+def zigbee_generic_decodeZigbeeData(String value, String cTypeStr, boolean reverseBytes=true) {
+    List values = value.split("(?<=\\G..)")
+    values = reverseBytes == true ? values.reverse() : values
+    Integer cType = Integer.parseInt(cTypeStr, 16)
+    Map rMap = [:]
+    rMap['raw'] = [:]
+    List ret = zigbee_generic_convertStructValue(rMap, values, cType, "NA", "NA")
+    return ret[0]["NA"]
+}
+
+// BEGIN:getLoggingFunction()
+private boolean logging(message) {
+    boolean didLogging = false
+     
+    Integer logLevelLocal = 0
+    if (infoLogging == null || infoLogging == true) {
+        log.info "$message"
+        didLogging = true
+    }
+    return didLogging
+}
+// END:  getLoggingFunction()
+
+//end markus toobox ////////////////////
+
+
+
+
+////////////////////////////////////////////////////////////////////////////
+
+def refresh() {
+    def dp = "0302"
+    def fn = "0"
+    def data = "00" // ??
+  
+   log.debug "refresh"
+    zigbee.readAttribute(0 , 0 )
+   
+}    
+
+
+
+///////////// commands ///////////////
+
+ 
+
+def setThermostatMode(String value) {
+    
+   
+    log.debug "Thermostat mode read is $value from CASE selection"
+   // state.ThermostatMode = "$value"
+   // log.debug "$state.ThermostatMode from CASE selection"
+        switch (value) {
+        case "heat":
+   //     case "emergencyHeat":
+            if (state.ONOFF != "OFF") {
+            return heat()
+            }
+        case "off":
+            return off()
+        
+        default:
+           log.debug "ON command as selection is not heat or OFF"
+            sendEvent(name: "thermostatMode", value: "heat" )
+            return on()
+    
+}
+}
+
+
+
+
+
+
+
+def off() { // TRV OFF
+    log.debug "OFF command - unsupported by device"
+   // def dp = "0101"
+   // def fn = "0001"
+   // def data = "00" // off
+	//log.info "Off command"
+    //sendEvent(name: "thermostatMode", value: "off" )
+    //state.ONOFF = "OFF"
+    //sendTuyaCommand(dp,fn,data)
+  
+}
+
+
+def on() { // TRV ON
+    log.debug "ON command - unsupported by device"
+    //def dp = "0101"
+    //def fn = "0001"
+    //def data = "01" // on
+	//log.info "On command"
+    //sendEvent(name: "thermostatMode", value: "heat" )
+    //state.ONOFF = "ON"
+    //sendTuyaCommand(dp,fn,data)
+    
+}
+
+
+def auto() { //manual and hubitat control
+    log.info "This command is unused"
+    heat()
+
+
+}
+
+def heat() { //manual and hubitat control
+    
+    def dp = "0404"
+    def fn = "00"
+    def data = "0102" // Heat - Normal operation
+	log.info "heat/cool/auto command - Set Normal"
+    sendEvent(name: "thermostatMode", value: "heat" )
+    state.ONOFF = "ON"
+    sendTuyaCommand(dp,fn,data)
+
+}
+
+def cool() {
+    log.info "Cool selected - setting heat as this is unsupported"
+    heat()
+}
+
+
+def setHeatingSetpoint(preciseDegrees) {
+	if (preciseDegrees != null) {
+        def dp = "0202"
+        def fn = "00"
+        def SP = preciseDegrees *10
+        def X = (SP / 256).intValue()
+        def Y = SP.intValue() % 256
+
+        def data = "040000" + zigbee.convertToHexString(X.intValue(), 2) + zigbee.convertToHexString(Y.intValue(), 2)
+	    log.info "heating setpoint to ${preciseDegrees}"
+	    sendTuyaCommand(dp,fn,data)
+	}
+}
+
+def updated() {
+    sendEvent(name: "supportedThermostatFanModes", value: [""])
+    sendEvent(name: "supportedThermostatModes", value: ["off", "cool", "heat", "auto"] )
+    sendEvent(name: "thermostatFanMode", value: "off")
+    log.info "${device.displayName} updated..."
+}
+    
+def installed() {
+    sendEvent(name: "supportedThermostatFanModes", value: [""])
+    sendEvent(name: "supportedThermostatModes", value: ["off", "cool", "heat", "auto"] )
+    sendEvent(name: "thermostatFanMode", value: "heat")
+    
+}
+    
+def configure(){    
+    log.warn "configure..."
+    runIn(1800,logsOff)    
+	//binding to Thermostat cluster"
+    // Set unused default values (for Google Home Integration)
+    sendEvent(name: "coolingSetpoint", value: "5")
+    //sendEvent(name: "thermostatFanMode", value:"auto")
+    updateDataValue("lastRunningMode", "heat") // heat is the only compatible mode for this device
+    updated()
+
+}
+void updateDataFromSimpleDescriptorData(List<String> data) {
+    Map<String,String> sdi = parseSimpleDescriptorData(data)
+    if(sdi != [:]) {
+        updateDataValue("endpointId", sdi['endpointId'])
+        updateDataValue("profileId", sdi['profileId'])
+        updateDataValue("inClusters", sdi['inClusters'])
+        updateDataValue("outClusters", sdi['outClusters'])
+        getInfo(true, sdi)
+    } else {
+        log.warn("No VALID Simple Descriptor Data received!")
+    }
+    sdi = null
+}
+
+
+//unused commands and redirected
+
+
+def emergencyHeat() {
+    log.info "emergencyHeat mode is not available for this device. => Defaulting to heat mode instead."
+	heat()
+}
+
+def setCoolingSetpoint(degrees) {
+    log.info "setCoolingSetpoint is not available for this device"
+}
+
+def fanAuto() {
+    log.info "fanAuto mode is not available for this device"
+}
+
+def fanCirculate(){
+    log.info "fanCirculate mode is not available for this device"
+}
+
+def fanOn(){
+    log.info "fanOn mode is not available for this device"
+}
+
+def setSchedule(JSON_OBJECT){
+    log.info "setSchedule is not available for this device"
+}
+
+def setThermostatFanMode(fanmode){
+    log.info "setThermostatFanMode is not available for this device"
+}
+
+
+List zigbee_generic_convertStructValueToList(List values, Integer cType) {
+    Map rMap = [:]
+    rMap['raw'] = [:]
+    List ret = zigbee_generic_convertStructValue(rMap, values, cType, "NA", "NA")
+    return [ret[0]["NA"], ret[1]]
+}
+
+List zigbee_generic_convertStructValue(Map r, List values, Integer cType, String cKey, String cTag) {
+    String cTypeStr = cType != null ? integerToHexString(cType, 1) : null
+    switch(cType) {
+        case 0x10:
+            r["raw"][cKey] = values.take(1)[0]
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16) != 0
+            values = values.drop(1)
+            break
+        case 0x18:
+        case 0x20:
+            r["raw"][cKey] = values.take(1)[0]
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(1)
+            break
+        case 0x19:
+        case 0x21:
+            r["raw"][cKey] = values.take(2).reverse().join()
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(2)
+            break
+        case 0x1A:
+        case 0x22:
+            r["raw"][cKey] = values.take(3).reverse().join()
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(3)
+            break
+        case 0x1B:
+        case 0x23:
+            r["raw"][cKey] = values.take(4).reverse().join()
+            r[cKey] = Long.parseLong(r["raw"][cKey], 16)
+            values = values.drop(4)
+            break
+        case 0x1C:
+        case 0x24:
+            r["raw"][cKey] = values.take(5).reverse().join()
+            r[cKey] = Long.parseLong(r["raw"][cKey], 16)
+            values = values.drop(5)
+            break
+        case 0x1D:
+        case 0x25:
+            r["raw"][cKey] = values.take(6).reverse().join()
+            r[cKey] = Long.parseLong(r["raw"][cKey], 16)
+            values = values.drop(6)
+            break
+        case 0x1E:
+        case 0x26:
+            r["raw"][cKey] = values.take(7).reverse().join()
+            r[cKey] = Long.parseLong(r["raw"][cKey], 16)
+            values = values.drop(7)
+            break
+        case 0x1F:
+        case 0x27:
+            r["raw"][cKey] = values.take(8).reverse().join()
+            r[cKey] = new BigInteger(r["raw"][cKey], 16)
+            values = values.drop(8)
+            break
+        case 0x28:
+            r["raw"][cKey] = values.take(1).reverse().join()
+            r[cKey] = convertToSignedInt8(Integer.parseInt(r["raw"][cKey], 16))
+            values = values.drop(1)
+            break
+        case 0x29:
+            r["raw"][cKey] = values.take(2).reverse().join()
+            r[cKey] = (Integer) (short) Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(2)
+            break
+        case 0x2B:
+            r["raw"][cKey] = values.take(4).reverse().join()
+            r[cKey] = (Integer) Long.parseLong(r["raw"][cKey], 16)
+            values = values.drop(4)
+            break
+        case 0x30:
+            r["raw"][cKey] = values.take(1)[0]
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(1)
+            break
+        case 0x31:
+            r["raw"][cKey] = values.take(2).reverse().join()
+            r[cKey] = Integer.parseInt(r["raw"][cKey], 16)
+            values = values.drop(2)
+            break
+        case 0x39:
+            r["raw"][cKey] = values.take(4).reverse().join()
+            r[cKey] = parseSingleHexToFloat(r["raw"][cKey])
+            values = values.drop(4)
+            break
+        case 0x42:
+            Integer strLength = Integer.parseInt(values.take(1)[0], 16)
+            values = values.drop(1)
+            r["raw"][cKey] = values.take(strLength)
+            r[cKey] = r["raw"][cKey].collect { 
+                (char)(int) Integer.parseInt(it, 16)
+            }.join()
+            values = values.drop(strLength)
+            break
+        default:
+            throw new Exception("The Struct used an unrecognized type: $cTypeStr ($cType) for tag 0x$cTag with key $cKey (values: $values, map: $r)")
+    }
+    return [r, values]
+}
+String integerToHexString(BigDecimal value, Integer minBytes, boolean reverse=false) {
+    return integerToHexString(value.intValue(), minBytes, reverse=reverse)
+}
+
+String integerToHexString(Integer value, Integer minBytes, boolean reverse=false) {
+    if(reverse == true) {
+        return HexUtils.integerToHexString(value, minBytes).split("(?<=\\G..)").reverse().join()
+    } else {
+        return HexUtils.integerToHexString(value, minBytes)
+    }
+    
+}
+
+private sendTuyaCommand(dp, fn, data) { // everything goes through here
+	log.info "sending $CLUSTER_TUYA,$SETDATA,00,${zigbee.convertToHexString(rand(256), 2)}=${dp},${fn},${data}"
+    
+    
+	zigbee.command(CLUSTER_TUYA, SETDATA, "00" + zigbee.convertToHexString(rand(256), 2) + dp + fn + data)
+ 
+}
+
+
+private getCLUSTER_TUYA() { 0xEF00 }
+private getSETDATA() { 0x00 }
+private rand(n) { return (new Random().nextInt(n))}
